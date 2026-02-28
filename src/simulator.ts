@@ -7,7 +7,7 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import { tmpdir } from "os";
 import { join } from "path";
-import { readFile, writeFile, unlink, readdir, stat } from "fs/promises";
+import { readFile, writeFile, unlink, readdir, stat, mkdir, rm } from "fs/promises";
 import { randomUUID } from "crypto";
 import { existsSync } from "fs";
 
@@ -72,6 +72,17 @@ async function ensureHandle(): Promise<WindowInfo> {
   return info;
 }
 
+/** Re-discover the handle if a PS call fails (simulator may have restarted). */
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e) {
+    cached = null;
+    await findSimulator();
+    return await fn();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -125,62 +136,72 @@ export async function findSimulator(): Promise<WindowInfo | null> {
 export async function sendKey(key: SimKey): Promise<string> {
   const mapped = KEY_MAP[key];
   if (!mapped) throw new Error(`Unknown key: ${key}. Valid: ${VALID_KEYS.join(", ")}`);
-  const info = await ensureHandle();
 
-  const script = [
-    'Add-Type @"',
-    "using System;",
-    "using System.Runtime.InteropServices;",
-    "public class W {",
-    '    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);',
-    "}",
-    '"@',
-    "Add-Type -AssemblyName System.Windows.Forms",
-    `[W]::SetForegroundWindow([IntPtr]::new([long]${info.handle})) | Out-Null`,
-    "Start-Sleep -Milliseconds 200",
-    `[System.Windows.Forms.SendKeys]::SendWait("${mapped}")`,
-    "Start-Sleep -Milliseconds 300",
-    `Write-Output "sent ${key} (${mapped})"`,
-  ].join("\r\n");
+  return withRetry(async () => {
+    const info = await ensureHandle();
+    const script = [
+      'Add-Type @"',
+      "using System;",
+      "using System.Runtime.InteropServices;",
+      "public class W {",
+      '    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);',
+      "}",
+      '"@',
+      "Add-Type -AssemblyName System.Windows.Forms",
+      `[W]::SetForegroundWindow([IntPtr]::new([long]${info.handle})) | Out-Null`,
+      "Start-Sleep -Milliseconds 200",
+      `[System.Windows.Forms.SendKeys]::SendWait("${mapped}")`,
+      "Start-Sleep -Milliseconds 300",
+      `Write-Output "sent ${key} (${mapped})"`,
+    ].join("\r\n");
 
-  return await runPs(script);
+    return await runPs(script);
+  });
 }
 
 export async function sendKeySequence(
   keys: Array<{ key: SimKey; delay?: number }>,
 ): Promise<string> {
-  const info = await ensureHandle();
-  const steps = keys.map((k) => {
-    const mapped = KEY_MAP[k.key];
-    if (!mapped) throw new Error(`Unknown key: ${k.key}`);
-    const delay = k.delay ?? 500;
-    return [
-      `[System.Windows.Forms.SendKeys]::SendWait("${mapped}")`,
-      `Start-Sleep -Milliseconds ${delay}`,
-      `Write-Output "  sent ${k.key}"`,
+  return withRetry(async () => {
+    const info = await ensureHandle();
+    const steps = keys.map((k) => {
+      const mapped = KEY_MAP[k.key];
+      if (!mapped) throw new Error(`Unknown key: ${k.key}`);
+      const delay = k.delay ?? 500;
+      return [
+        `[System.Windows.Forms.SendKeys]::SendWait("${mapped}")`,
+        `Start-Sleep -Milliseconds ${delay}`,
+        `Write-Output "  sent ${k.key}"`,
+      ].join("\r\n");
+    });
+
+    const script = [
+      'Add-Type @"',
+      "using System;",
+      "using System.Runtime.InteropServices;",
+      "public class W {",
+      '    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);',
+      "}",
+      '"@',
+      "Add-Type -AssemblyName System.Windows.Forms",
+      `[W]::SetForegroundWindow([IntPtr]::new([long]${info.handle})) | Out-Null`,
+      "Start-Sleep -Milliseconds 200",
+      ...steps,
+      'Write-Output "sequence complete"',
     ].join("\r\n");
+
+    return await runPs(script);
   });
-
-  const script = [
-    'Add-Type @"',
-    "using System;",
-    "using System.Runtime.InteropServices;",
-    "public class W {",
-    '    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);',
-    "}",
-    '"@',
-    "Add-Type -AssemblyName System.Windows.Forms",
-    `[W]::SetForegroundWindow([IntPtr]::new([long]${info.handle})) | Out-Null`,
-    "Start-Sleep -Milliseconds 200",
-    ...steps,
-    'Write-Output "sequence complete"',
-  ].join("\r\n");
-
-  return await runPs(script);
 }
 
 export async function screenshot(): Promise<Buffer> {
-  const info = await ensureHandle();
+  return withRetry(async () => {
+    const info = await ensureHandle();
+    return _captureWindow(info);
+  });
+}
+
+async function _captureWindow(info: WindowInfo): Promise<Buffer> {
   const outFile = join(tmpdir(), `ciq_screenshot_${randomUUID().slice(0, 8)}.png`);
   const outFileEscaped = outFile.replace(/\\/g, "\\\\");
 
@@ -299,7 +320,7 @@ export async function buildApp(opts: {
 
   const outDir = join(opts.projectPath, "build");
   if (!existsSync(outDir)) {
-    await writeFile(join(outDir, ".gitkeep"), "");
+    await mkdir(outDir, { recursive: true });
   }
 
   const javaDir = join(java, "..");
@@ -422,6 +443,8 @@ export async function testSequence(
       if (!mapped) throw new Error(`Unknown key: ${step.key}`);
       const delay = step.delay ?? 500;
       lines.push(`Write-Output "KEY:${step.key}"`);
+      lines.push("[W]::SetForegroundWindow($hwnd) | Out-Null");
+      lines.push("Start-Sleep -Milliseconds 100");
       lines.push(`[System.Windows.Forms.SendKeys]::SendWait("${mapped}")`);
       lines.push(`Start-Sleep -Milliseconds ${delay}`);
     } else if (step.action === "wait") {
@@ -470,8 +493,7 @@ export async function testSequence(
 
   // Clean up temp dir if we created it
   if (!outputDir) {
-    const { rmdir } = await import("fs/promises");
-    await rmdir(frameDir).catch(() => {});
+    await rm(frameDir, { recursive: true, force: true }).catch(() => {});
   }
 
   return { log, frames };
