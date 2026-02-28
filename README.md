@@ -12,6 +12,7 @@ Send keys, take screenshots, build apps, and push them to the simulator – all 
 | `send_key` | Send a single key press: `up`, `down`, `enter`, `esc`, `menu`, `back` |
 | `send_key_sequence` | Send multiple keys with configurable delays |
 | `screenshot` | Capture the simulator window as PNG |
+| `test_sequence` | Interleaved keys + screenshots for visual UI testing |
 | `launch_simulator` | Start the CIQ Simulator (auto-detects SDK path) |
 | `build_app` | Compile a Connect IQ project with `monkeyc` |
 | `push_app` | Push a `.prg` to the running simulator with `monkeydo` |
@@ -107,6 +108,28 @@ Once configured, you can ask your AI assistant:
 > "Build my padel-tracker app and push it to the simulator"
 
 > "Send this key sequence: enter, wait 1s, down, wait 500ms, enter"
+
+> "Run a test sequence: screenshot, press enter, screenshot, press down, screenshot — so I can see each state"
+
+### test_sequence Example
+
+The `test_sequence` tool runs a full scripted interaction in one call — keys and screenshots interleaved — and returns all captured frames inline so you can visually verify each app state:
+
+```json
+{
+  "steps": [
+    { "action": "screenshot", "label": "initial" },
+    { "action": "key", "key": "enter", "delay": 800 },
+    { "action": "screenshot", "label": "after_enter" },
+    { "action": "key", "key": "down", "delay": 500 },
+    { "action": "screenshot", "label": "after_down" },
+    { "action": "wait", "ms": 1000 },
+    { "action": "screenshot", "label": "final" }
+  ]
+}
+```
+
+The response contains interleaved text labels and PNG images — the AI can see exactly what happened at each step and evaluate the UI.
 
 ## License
 

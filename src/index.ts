@@ -8,6 +8,7 @@
  *   send_key         – send a single key press (up/down/enter/esc/menu/back)
  *   send_key_sequence– send multiple keys with delays
  *   screenshot       – capture the simulator window as PNG
+ *   test_sequence    – interleaved keys + screenshots for visual testing
  *   launch_simulator – start the CIQ simulator
  *   build_app        – compile a Connect IQ project
  *   push_app         – push a .prg to the running simulator
@@ -106,6 +107,82 @@ server.tool(
           },
         ],
       };
+    } catch (e: any) {
+      return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
+    }
+  },
+);
+
+// ── test_sequence ───────────────────────────────────────────────────────────
+
+const stepSchema = z.discriminatedUnion("action", [
+  z.object({
+    action: z.literal("screenshot"),
+    label: z.string().describe("Name for this screenshot (e.g. 'after_enter', 'main_screen')"),
+  }),
+  z.object({
+    action: z.literal("key"),
+    key: z.enum(["up", "down", "enter", "esc", "menu", "back"]),
+    delay: z.number().optional().describe("Delay in ms after key press (default 500)"),
+  }),
+  z.object({
+    action: z.literal("wait"),
+    ms: z.number().describe("Milliseconds to wait"),
+  }),
+]);
+
+server.tool(
+  "test_sequence",
+  `Run an interleaved sequence of key presses and screenshots in a single operation.
+Each step is either:
+  - {"action":"screenshot","label":"name"} – capture the simulator
+  - {"action":"key","key":"enter","delay":500} – send a key and wait
+  - {"action":"wait","ms":1000} – pause
+Returns all captured screenshots as images so you can visually verify each state.`,
+  {
+    steps: z.array(stepSchema).describe("Ordered list of actions to perform"),
+    output_dir: z
+      .string()
+      .optional()
+      .describe("Optional directory to save screenshots (temp dir if omitted)"),
+  },
+  async ({ steps, output_dir }) => {
+    try {
+      const result = await sim.testSequence(steps, output_dir);
+      const content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> = [];
+
+      // Build interleaved text + image response
+      let logIdx = 0;
+      for (const line of result.log) {
+        if (line.startsWith("FRAME:")) {
+          const label = line.slice(6);
+          const frame = result.frames.find((f) => f.label === label);
+          content.push({ type: "text", text: `📸 ${label}` });
+          if (frame) {
+            content.push({
+              type: "image",
+              data: frame.buffer.toString("base64"),
+              mimeType: "image/png",
+            });
+          }
+        } else if (line.startsWith("KEY:")) {
+          content.push({ type: "text", text: `⌨️  Sent key: ${line.slice(4)}` });
+        }
+      }
+
+      if (output_dir) {
+        content.push({
+          type: "text",
+          text: `\nScreenshots saved to: ${output_dir}`,
+        });
+      }
+
+      content.push({
+        type: "text",
+        text: `\n✅ Sequence complete: ${result.frames.length} screenshots captured.`,
+      });
+
+      return { content: content as any };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };
     }

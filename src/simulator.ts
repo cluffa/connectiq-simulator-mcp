@@ -340,6 +340,143 @@ export async function pushApp(opts: {
   return (stdout + "\n" + stderr).trim() || "App pushed to simulator.";
 }
 
+// ---------------------------------------------------------------------------
+// Test sequence – interleaved keys + screenshots in a single PS process
+// ---------------------------------------------------------------------------
+
+export type TestStep =
+  | { action: "screenshot"; label: string }
+  | { action: "key"; key: SimKey; delay?: number }
+  | { action: "wait"; ms: number };
+
+export interface TestFrame {
+  label: string;
+  buffer: Buffer;
+}
+
+export interface TestResult {
+  log: string[];
+  frames: TestFrame[];
+}
+
+export async function testSequence(
+  steps: TestStep[],
+  outputDir?: string,
+): Promise<TestResult> {
+  const info = await ensureHandle();
+  const runId = randomUUID().slice(0, 8);
+  const frameDir = outputDir ?? join(tmpdir(), `ciq_test_${runId}`);
+  const frameDirEscaped = frameDir.replace(/\\/g, "\\\\");
+
+  // Build the PS script
+  const lines: string[] = [
+    // --- Win32 types ---
+    'Add-Type @"',
+    "using System;",
+    "using System.Runtime.InteropServices;",
+    "public class W {",
+    '    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);',
+    '    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);',
+    "    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }",
+    "}",
+    '"@',
+    "Add-Type -AssemblyName System.Windows.Forms",
+    "Add-Type -AssemblyName System.Drawing",
+    "",
+    `$outDir = "${frameDirEscaped}"`,
+    "if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Force -Path $outDir | Out-Null }",
+    "",
+    `$hwnd = [IntPtr]::new([long]${info.handle})`,
+    "[W]::SetForegroundWindow($hwnd) | Out-Null",
+    "Start-Sleep -Milliseconds 300",
+    "",
+    "# --- helper: capture screenshot ---",
+    "function Snap($name) {",
+    "    Start-Sleep -Milliseconds 400",
+    "    $rect = New-Object W+RECT",
+    "    [W]::GetWindowRect($hwnd, [ref]$rect) | Out-Null",
+    "    $w = $rect.Right - $rect.Left",
+    "    $h = $rect.Bottom - $rect.Top",
+    "    $bmp = New-Object System.Drawing.Bitmap($w, $h)",
+    "    $gfx = [System.Drawing.Graphics]::FromImage($bmp)",
+    "    $gfx.CopyFromScreen($rect.Left, $rect.Top, 0, 0, (New-Object System.Drawing.Size($w, $h)))",
+    "    $gfx.Dispose()",
+    '    $file = Join-Path $outDir "$name.png"',
+    "    $bmp.Save($file)",
+    "    $bmp.Dispose()",
+    '    Write-Output "FRAME:$name"',
+    "}",
+    "",
+    'Write-Output "=== Test sequence start ==="',
+    "",
+  ];
+
+  let frameIndex = 0;
+  for (const step of steps) {
+    if (step.action === "screenshot") {
+      const safeName = `${String(frameIndex).padStart(2, "0")}_${step.label.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+      lines.push(`Snap "${safeName}"`);
+      frameIndex++;
+    } else if (step.action === "key") {
+      const mapped = KEY_MAP[step.key];
+      if (!mapped) throw new Error(`Unknown key: ${step.key}`);
+      const delay = step.delay ?? 500;
+      lines.push(`Write-Output "KEY:${step.key}"`);
+      lines.push(`[System.Windows.Forms.SendKeys]::SendWait("${mapped}")`);
+      lines.push(`Start-Sleep -Milliseconds ${delay}`);
+    } else if (step.action === "wait") {
+      lines.push(`Start-Sleep -Milliseconds ${step.ms}`);
+    }
+  }
+
+  lines.push('', 'Write-Output "=== Test sequence done ==="');
+
+  const script = lines.join("\r\n");
+
+  // Increase timeout for long sequences (base 30s + 3s per step)
+  const timeout = 30000 + steps.length * 3000;
+  const tmp = join(tmpdir(), `ciq_test_${runId}.ps1`);
+  await writeFile(tmp, script, "utf-8");
+
+  let stdout: string;
+  try {
+    const result = await execAsync(
+      `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -STA -File "${tmp}"`,
+      { maxBuffer: 50 * 1024 * 1024, timeout },
+    );
+    stdout = result.stdout.trim();
+  } finally {
+    await unlink(tmp).catch(() => {});
+  }
+
+  // Parse output and read frame files
+  const log = stdout.split(/\r?\n/).filter(Boolean);
+  const frameLabels = log
+    .filter((l) => l.startsWith("FRAME:"))
+    .map((l) => l.slice(6));
+
+  const frames: TestFrame[] = [];
+  for (const label of frameLabels) {
+    const filePath = join(frameDir, `${label}.png`);
+    try {
+      const buffer = await readFile(filePath);
+      frames.push({ label, buffer });
+      // Clean up temp file (but leave if outputDir was specified)
+      if (!outputDir) await unlink(filePath).catch(() => {});
+    } catch {
+      // Frame file missing – skip
+    }
+  }
+
+  // Clean up temp dir if we created it
+  if (!outputDir) {
+    const { rmdir } = await import("fs/promises");
+    await rmdir(frameDir).catch(() => {});
+  }
+
+  return { log, frames };
+}
+
 export function clearCache(): void {
   cached = null;
 }
