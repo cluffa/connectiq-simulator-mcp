@@ -1,14 +1,16 @@
 # connectiq-simulator-mcp
 
-MCP server for automating the **Garmin Connect IQ Simulator** on Windows.
+MCP server for automating the **Garmin Connect IQ Simulator** — macOS port.
 
 Send keys, take screenshots, build apps, and push them to the simulator – all from an AI assistant (Claude Code, Cursor, etc.) via the [Model Context Protocol](https://modelcontextprotocol.io).
+
+> **Platforms:** macOS (this fork). For the [original Windows version](https://github.com/thomaszipf/connectiq-simulator-mcp), see [thomaszipf/connectiq-simulator-mcp](https://github.com/thomaszipf/connectiq-simulator-mcp).
 
 ## Tools
 
 | Tool | Description |
 |------|-------------|
-| `find_simulator` | Detect the running simulator window (handle, title, bounds) |
+| `find_simulator` | Detect the running simulator window (PID, title, bounds) |
 | `send_key` | Send a single key press: `up`, `down`, `enter`, `esc`, `menu`, `back` |
 | `send_key_sequence` | Send multiple keys with configurable delays |
 | `screenshot` | Capture the simulator window as PNG |
@@ -19,22 +21,23 @@ Send keys, take screenshots, build apps, and push them to the simulator – all 
 
 ## Requirements
 
-- **Windows 10/11** (uses Win32 APIs via PowerShell)
+- **macOS** (uses `osascript` for window control and `screencapture` for screenshots)
 - **Node.js** >= 18
-- **Garmin Connect IQ SDK** installed via the SDK Manager
-- **Java JDK** (for building apps – auto-detected from `JAVA_HOME` or common paths)
-- **PowerShell** (included with Windows)
+- **Garmin Connect IQ SDK** installed via the SDK Manager (auto-detected from `~/Library/Application Support/Garmin/ConnectIQ/Sdks/`)
+- **Java JDK** (for building apps – auto-detected via `/usr/libexec/java_home`)
 
 ## Installation
 
+### From npm (coming soon)
+
 ```bash
-npm install -g connectiq-simulator-mcp
+npm install -g @cluffa/connectiq-simulator-mcp
 ```
 
-Or clone and build locally:
+### From source
 
 ```bash
-git clone https://github.com/thomaszipf/connectiq-simulator-mcp.git
+git clone https://github.com/cluffa/connectiq-simulator-mcp.git
 cd connectiq-simulator-mcp
 npm install
 npm run build
@@ -51,41 +54,26 @@ Add to your `~/.claude/settings.json`:
   "mcpServers": {
     "connectiq-simulator": {
       "command": "node",
-      "args": ["C:/path/to/connectiq-simulator-mcp/dist/index.js"]
+      "args": ["/path/to/connectiq-simulator-mcp/dist/index.js"]
     }
   }
 }
 ```
 
-### Claude Desktop
+### Claude Desktop / Cursor / VS Code
 
-Add to `claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "connectiq-simulator": {
-      "command": "node",
-      "args": ["C:/path/to/connectiq-simulator-mcp/dist/index.js"]
-    }
-  }
-}
-```
-
-### Cursor / VS Code
-
-Add to your MCP settings with the same `command` and `args`.
+Same `command` and `args` — point `args[0]` to the absolute path of `dist/index.js`.
 
 ## How It Works
 
-The server uses **PowerShell** subprocess calls to interact with Win32 APIs:
+The server uses **osascript** (AppleScript) subprocess calls to interact with the simulator:
 
-- **Window detection**: `Get-Process` + `GetWindowRect` to find the simulator
-- **Key sending**: `SetForegroundWindow` + `SendKeys.SendWait` for key presses
-- **Screenshots**: `Graphics.CopyFromScreen` to capture the window region
-- **Building/pushing**: Shells out to `monkeyc.bat` / `monkeydo.bat`
+- **Window detection**: `System Events` process/window queries
+- **Key sending**: AppleScript `keystroke` / `key code` sent to the simulator process
+- **Screenshots**: Native `screencapture -R` with window coordinates
+- **Building/pushing**: Shells out to `monkeyc` / `monkeydo`
 
-No native Node.js modules are needed – everything works through PowerShell.
+No native Node.js modules are needed — everything works through macOS built-in utilities.
 
 ### Simulator Key Mapping
 
@@ -93,7 +81,7 @@ No native Node.js modules are needed – everything works through PowerShell.
 |-----------------|-----|
 | UP | `up` (Up arrow) |
 | DOWN | `down` (Down arrow) |
-| ENTER / START | `enter` (Enter) |
+| ENTER / START | `enter` (Return) |
 | BACK / ESC | `esc` (Escape) |
 | MENU | `menu` (F3) |
 
@@ -131,6 +119,17 @@ The `test_sequence` tool runs a full scripted interaction in one call — keys a
 
 The response contains interleaved text labels and PNG images — the AI can see exactly what happened at each step and evaluate the UI.
 
+## Differences from the original Windows version
+
+| Feature | Windows (original) | macOS (this fork) |
+|---------|-------------------|-------------------|
+| Window detection | PowerShell + Win32 `GetWindowRect` | AppleScript `System Events` |
+| Key injection | `SendKeys.SendWait` | AppleScript `keystroke` / `key code` |
+| Screenshot | `Graphics.CopyFromScreen` | `screencapture -R` |
+| SDK detection | `%APPDATA%\Garmin\ConnectIQ\Sdks` | `~/Library/Application Support/Garmin/ConnectIQ/Sdks` |
+| Java detection | `JAVA_HOME` + common paths | `/usr/libexec/java_home` |
+| Process launch | `simulator.exe` | `open -a ConnectIQ.app` |
+
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

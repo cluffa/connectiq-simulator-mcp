@@ -1,9 +1,9 @@
 {
-  "name": "connectiq-simulator-mcp",
-  "version": "0.1.0",
-  "description": "MCP server for Garmin Connect IQ Simulator – send keys, take screenshots, build & push apps",
+  "name": "@cluffa/connectiq-simulator-mcp",
+  "version": "0.2.0",
+  "description": "MCP server for Garmin Connect IQ Simulator — send keys, take screenshots, build & push apps (macOS port)",
   "license": "MIT",
-  "author": "thomaszipf",
+  "author": "thomaszipf (original); cluffa (macOS port)",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -27,5 +27,10 @@
   },
   "engines": {
     "node": ">=18"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cluffa/connectiq-simulator-mcp.git"
+  },
+  "keywords": ["mcp", "garmin", "connect-iq", "simulator", "macos", "testing"]
 }
