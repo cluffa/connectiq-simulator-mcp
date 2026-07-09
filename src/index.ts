@@ -199,10 +199,14 @@ server.tool(
       .string()
       .optional()
       .describe("Path to SDK bin directory (auto-detected if omitted)"),
+    restart: z
+      .boolean()
+      .optional()
+      .describe("Kill and restart the simulator if already running (clears BLE profiles)"),
   },
-  async ({ sdk_path }) => {
+  async ({ sdk_path, restart }) => {
     try {
-      const result = await sim.launchSimulator(sdk_path);
+      const result = await sim.launchSimulator(sdk_path, restart ?? false);
       return { content: [{ type: "text", text: result }] };
     } catch (e: any) {
       return { content: [{ type: "text", text: `Error: ${e.message}` }], isError: true };

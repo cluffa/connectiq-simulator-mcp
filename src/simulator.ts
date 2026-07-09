@@ -5,9 +5,11 @@
  * Ported from the original Windows/PowerShell implementation by thomaszipf.
  */
 
-import { exec } from "child_process";
+import { exec, execFile } from "child_process";
 import { execSync } from "child_process";
 import { promisify } from "util";
+
+const execFileAsync = promisify(execFile);
 import { tmpdir, homedir } from "os";
 import { join } from "path";
 import { readFile, writeFile, unlink, readdir, mkdir, rm } from "fs/promises";
@@ -398,31 +400,90 @@ export async function findJavaPath(): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------------------
-// Launch simulator
+// Simulator process management
 // ---------------------------------------------------------------------------
 
-/** Launch the CIQ Simulator. On macOS this uses 'open' on the ConnectIQ app. */
-export async function launchSimulator(sdkPath?: string): Promise<string> {
+/** Find the simulator binary path. Checks both SDK install and .Garmin runtime. */
+async function findSimulatorBinary(sdkPath?: string): Promise<string> {
   const sdk = sdkPath ?? (await findSdkPath());
-  if (!sdk) throw new Error("SDK path not found. Pass sdk_path or install the Connect IQ SDK.");
+  if (!sdk) throw new Error("SDK path not found.");
+
+  const simBinary = join(sdk, "ConnectIQ.app", "Contents", "MacOS", "simulator");
+  if (existsSync(simBinary)) return simBinary;
+
+  // Also check .Garmin runtime mirror
+  const altSdk = sdk.replace(
+    join(homedir(), "Library", "Application Support"),
+    join(homedir(), ".Garmin"),
+  );
+  const altBinary = join(altSdk, "ConnectIQ.app", "Contents", "MacOS", "simulator");
+  if (existsSync(altBinary)) return altBinary;
+
+  throw new Error(`simulator binary not found at ${simBinary}`);
+}
+
+/** Kill the simulator process by name. */
+function killSimulator(): void {
+  try {
+    execSync('pkill -f "Contents/MacOS/simulator"', { stdio: "ignore" });
+  } catch {
+    // process may not exist
+  }
+  cached = null;
+}
+
+/** Launch the CIQ Simulator via the SDK Manager GUI.
+ *  Opens ConnectIQ.app, auto-launches the last-used device (Enter keypress
+ *  via AppleScript), and waits for the simulator window to appear.
+ *  If already running, kills and restarts it fresh when restart=true. */
+export async function launchSimulator(sdkPath?: string, restart = false): Promise<string> {
+  if (restart) {
+    killSimulator();
+    await new Promise((r) => setTimeout(r, 1500));
+  }
+
+  // Check if already running with a loaded device
+  const existing = await findSimulator();
+  if (existing && !restart) {
+    return `Simulator already running: ${existing.title} (${existing.width}x${existing.height})`;
+  }
+
+  const sdk = sdkPath ?? (await findSdkPath());
+  if (!sdk) throw new Error("SDK path not found.");
 
   const appPath = join(sdk, "ConnectIQ.app");
   if (!existsSync(appPath)) {
     throw new Error(`ConnectIQ.app not found at ${appPath}`);
   }
 
-  // Launch the app
-  exec(`open -a "${appPath}"`, (err) => {
+  // Open the SDK Manager
+  execFile("open", [appPath], (err) => {
     if (err) throw err;
   });
 
+  // Wait for SDK Manager window, then press Enter to launch last-used device.
+  // The SDK Manager remembers LastUsedDevice from simulator.ini.
+  await new Promise((r) => setTimeout(r, 4000));
+  try {
+    await runApplescript(`
+tell application "System Events"
+    tell process "simulator"
+        set frontmost to true
+        delay 0.5
+        keystroke return
+    end tell
+end tell`);
+  } catch {
+    // If AppleScript fails, the simulator might have auto-launched already
+  }
+
   // Wait for simulator window to appear
-  for (let i = 0; i < 15; i++) {
+  for (let i = 0; i < 25; i++) {
     await new Promise((r) => setTimeout(r, 1000));
     const info = await findSimulator();
     if (info) return `Simulator launched: ${info.title} (${info.width}x${info.height})`;
   }
-  return "ConnectIQ.app started but simulator window not detected yet. Try find_simulator in a few seconds. Launch the simulator from within the SDK Manager if needed.";
+  return "ConnectIQ.app opened but simulator window not detected. The device may need to be launched manually from the SDK Manager.";
 }
 
 // ---------------------------------------------------------------------------
@@ -441,7 +502,6 @@ export async function buildApp(opts: {
   const device = opts.device ?? "fenix7";
   const monkeyc = join(sdk, "monkeyc");
   const monkeyJungle = join(opts.projectPath, "monkey.jungle");
-  const devKey = join(opts.projectPath, "developer_key.der");
 
   if (!existsSync(monkeyJungle)) throw new Error(`monkey.jungle not found at ${monkeyJungle}`);
 
@@ -453,21 +513,24 @@ export async function buildApp(opts: {
   const outFile = join(outDir, "app.prg");
 
   // Try to find developer key in common locations
-  let keyArg = "";
+  const devKey = join(opts.projectPath, "developer_key.der");
+  let keyPath = "";
   if (existsSync(devKey)) {
-    keyArg = `-y "${devKey}"`;
+    keyPath = devKey;
   } else {
-    // Check home directory
     const homeKey = join(homedir(), "Documents", "garmin_developer_key.der");
     if (existsSync(homeKey)) {
-      keyArg = `-y "${homeKey}"`;
+      keyPath = homeKey;
     }
   }
 
-  const cmd = `"${monkeyc}" -f "${monkeyJungle}" -d ${device} ${keyArg} -w -o "${outFile}"`;
+  // Build args to execFile (no shell, no quoting issues with spaces in paths)
+  const args = keyPath
+    ? ["-f", monkeyJungle, "-y", keyPath, "-d", device, "-w", "-o", outFile]
+    : ["-f", monkeyJungle, "-d", device, "-w", "-o", outFile];
 
   try {
-    const { stdout, stderr } = await execAsync(cmd, {
+    const { stdout, stderr } = await execFileAsync(monkeyc, args, {
       timeout: 120000,
       maxBuffer: 10 * 1024 * 1024,
     });
@@ -485,7 +548,12 @@ export async function buildApp(opts: {
 // Push app to simulator
 // ---------------------------------------------------------------------------
 
-/** Push a compiled .prg to the running simulator using monkeydo. */
+/** Push a compiled .prg to the running simulator using monkeydo.
+ *  Calls Java directly (bypassing the monkeydo shell script) to avoid
+ *  path-quoting issues with execFile/exec on paths containing spaces.
+ *  If monkeydo fails with "Too Many Profiles" (BLE profile exhaustion from
+ *  repeated pushes), kills and restarts the simulator automatically, then
+ *  retries once. */
 export async function pushApp(opts: {
   prgPath: string;
   device?: string;
@@ -495,22 +563,55 @@ export async function pushApp(opts: {
   if (!sdk) throw new Error("SDK path not found.");
 
   const device = opts.device ?? "fenix7";
-  const monkeydo = join(sdk, "monkeydo");
+  const monkeybrainsJar = join(sdk, "monkeybrains.jar");
+  const shellScript = join(sdk, "shell");
+  const javaPath = await findJavaPath();
 
-  if (!existsSync(monkeydo)) throw new Error(`monkeydo not found at ${monkeydo}`);
+  if (!javaPath) throw new Error("Java not found.");
+  if (!existsSync(monkeybrainsJar)) throw new Error(`monkeybrains.jar not found at ${monkeybrainsJar}`);
   if (!existsSync(opts.prgPath)) throw new Error(`PRG file not found: ${opts.prgPath}`);
 
-  const cmd = `"${monkeydo}" "${opts.prgPath}" ${device}`;
+  const java = javaPath; // narrowed for closure capture
 
-  try {
-    const { stdout, stderr } = await execAsync(cmd, {
-      timeout: 60000,
+  async function runMonkeydo(): Promise<string> {
+    const { stdout, stderr } = await execFileAsync(java, [
+      "-classpath", monkeybrainsJar,
+      "com.garmin.monkeybrains.monkeydodeux.MonkeyDoDeux",
+      "-f", opts.prgPath,
+      "-d", device,
+      "-s", shellScript,
+    ], {
+      timeout: 30000,
       maxBuffer: 10 * 1024 * 1024,
     });
-    const output = (stdout + "\n" + stderr).trim();
+    return (stdout + "\n" + stderr).trim();
+  }
+
+  try {
+    const output = await runMonkeydo();
     return output || "App pushed to simulator.";
   } catch (e: any) {
-    return `Push failed: ${e.stdout || e.stderr || e.message}`;
+    const output = e.stdout || e.stderr || e.message || "";
+
+    // "Too Many Profiles" = BLE profile exhaustion from repeated pushes.
+    // Restart the simulator and retry once.
+    if (output.includes("Too Many Profiles")) {
+      // Kill and relaunch with fresh BLE state
+      killSimulator();
+      await new Promise((r) => setTimeout(r, 1500));
+      await launchSimulator(sdk);
+      await new Promise((r) => setTimeout(r, 2000));
+
+      // Retry
+      try {
+        const retryOutput = await runMonkeydo();
+        return (retryOutput || "App pushed to simulator.") + " (simulator was restarted to clear BLE profiles)";
+      } catch (retryErr: any) {
+        return `Push failed after restart: ${retryErr.stdout || retryErr.stderr || retryErr.message}`;
+      }
+    }
+
+    return `Push failed: ${output}`;
   }
 }
 
